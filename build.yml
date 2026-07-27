@@ -1,0 +1,118 @@
+name: Build DDU
+
+on:
+  push:
+    branches: [ WPF ]
+  pull_request:
+    branches: [ WPF ]
+  schedule:
+    - cron: '*/15 * * * *'  # Run every 15 minutes to check for updates
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync-and-build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up git user
+      run: |
+        git config --global user.name "github-actions[bot]"
+        git config --global user.email "github-actions[bot]@users.noreply.github.com"
+      shell: pwsh
+
+    - name: Setup MSBuild
+      uses: microsoft/setup-msbuild@v1.1
+
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: '8.0.x'
+
+    - name: Configure TLS 1.2
+      run: |
+        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+      shell: pwsh
+
+    - name: Sync with upstream
+      run: |
+        git remote add upstream https://github.com/Wagnard/display-drivers-uninstaller.git
+        git fetch upstream
+        git checkout WPF
+        git merge upstream/WPF
+      shell: pwsh
+
+    - name: Get version from AssemblyInfo
+      id: get_version
+      run: |
+        $content = Get-Content 'display-driver-uninstaller/Display Driver Uninstaller/My Project/AssemblyInfo.vb' | 
+                  Select-String -Pattern 'AssemblyVersion\("([0-9.]+)"\)' | 
+                  ForEach-Object { $_.Matches[0].Groups[1].Value }
+        echo "version=$content" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      shell: pwsh
+
+    - name: Restore NuGet packages
+      run: nuget restore "display-driver-uninstaller/Display Driver Uninstaller.sln"
+      shell: pwsh
+
+    - name: Build solution
+      run: |
+        msbuild "display-driver-uninstaller/Display Driver Uninstaller.sln" /p:Configuration=Release /p:Platform="Any CPU" /verbosity:minimal
+      shell: pwsh
+
+    - name: List output directory
+      run: |
+        Get-ChildItem -Recurse "display-driver-uninstaller/Display Driver Uninstaller/bin/Release"
+      shell: pwsh
+
+    - name: Create artifact
+      run: |
+        mkdir artifact
+        Copy-Item "display-driver-uninstaller/Display Driver Uninstaller/bin/Release/*" -Destination "artifact/" -Recurse
+      shell: pwsh
+
+    - name: Zip build output
+      run: |
+        Compress-Archive -Path artifact/* -DestinationPath DDU-Build.zip
+      shell: pwsh
+
+    - name: Generate Changelog
+      id: changelog
+      run: |
+        git fetch upstream --tags --force
+        $latestTag = git tag --sort=-v:refname | Select-Object -First 1
+        Write-Host "Latest tag found: $latestTag"
+        
+        $range = if ($latestTag) { "$latestTag..upstream/WPF" } else { "upstream/WPF" }
+        Write-Host "Using commit range: $range"
+
+        $commits = git log $range --pretty=format:'- %s (%cs)' --no-merges
+        
+        # Если коммитов нет, создать сообщение по умолчанию
+        if ([string]::IsNullOrWhiteSpace($commits)) {
+          $commits = "- No new user-facing changes since the last release."
+        }
+
+        Write-Host "Generated Changelog:"
+        Write-Host $commits
+
+        # Экранирование для многострочного вывода
+        $commits = $commits -replace '%', '%25' -replace "`n", '%0A' -replace "`r", '%0D'
+        echo "notes=$commits" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      shell: pwsh
+
+    - name: Create or Update Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ steps.get_version.outputs.version }}
+        name: "DDU ${{ steps.get_version.outputs.version }}"
+        body: ${{ steps.changelog.outputs.notes }}
+        files: DDU-Build.zip
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
